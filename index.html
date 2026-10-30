@@ -24,6 +24,9 @@ body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:16p
   padding:max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));}
 .wrap{max-width:520px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
 .chips{display:flex;gap:6px;flex-wrap:wrap}
+.set-grid{display:grid;grid-template-columns:1fr;gap:6px;margin:12px 0 8px}
+.set-grid label{font-size:14px;font-weight:700;margin-top:6px}
+.set-grid select{font:inherit;font-size:16px;padding:10px;border-radius:10px;border:2px solid var(--line);background:var(--bg);color:var(--ink);width:100%}
 header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 h1{font-size:20px;margin:0;letter-spacing:.02em}
 .gps{display:flex;align-items:center;gap:8px;font-size:14px;padding:6px 10px;border-radius:999px;border:2px solid var(--line);background:var(--panel);font-variant-numeric:tabular-nums}
@@ -109,7 +112,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   <button id="reset" type="button">重置</button>
 </div>
 <label class="opt"><input type="checkbox" id="auto" checked>
-  <span>自動起航：按「開始」先鎖定起點，船一動才起表。起表時間以動作感測器偵測到的第一槳加速為準；第一次按開始時 iPhone 會詢問「動作與方向」權限，請選允許。</span></label>
+  <span>自動起航：按「開始」先鎖定起點，船一動才起表。起表時間以動作感測器偵測到的第一槳加速為準（按開始後請靜止 3 秒以上再起航）；第一次按開始時 iPhone 會詢問「動作與方向」權限，請選允許。</span></label>
 
 <section class="res hero">
   <h2>0 → 200 m <span id="r200note">—</span></h2>
@@ -153,9 +156,30 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   <textarea id="csvBox" readonly hidden></textarea>
 </details>
 
+<details id="settings">
+  <summary>設定（省電）</summary>
+  <div class="set-grid">
+    <label for="fps">計時器更新頻率</label>
+    <select id="fps">
+      <option value="1">每秒 1 次（最省電）</option>
+      <option value="4" selected>每秒 4 次（建議）</option>
+      <option value="10">每秒 10 次</option>
+      <option value="30">每秒 30 次（最耗電）</option>
+    </select>
+    <label for="idle">閒置多久自動暫停 GPS</label>
+    <select id="idle">
+      <option value="0">不暫停</option>
+      <option value="3">3 分鐘</option>
+      <option value="5" selected>5 分鐘</option>
+      <option value="10">10 分鐘</option>
+    </select>
+  </div>
+  <p class="note">只影響畫面上碼表跳動的速度，不影響量測精度；成績是用 GPS 與動作感測器的時間計算。GPS 本身約每秒更新 1 次，由手機決定。GPS 暫停後要再測，按「開始」或右上角 GPS 標籤重新定位，等燈號變綠再起航。動作感測器只在等待起航和測量時開啟。</p>
+</details>
+
 <p class="note">速度單位為 km/h，下方小字為 m/s。距離由 GPS 都卜勒速度逐秒累加，過線時間在兩筆定位之間依加速度推算；起表時間優先採用動作感測器偵測的起航瞬間。精度比單純用位置相減好，但仍受手機 GPS 限制，適合看訓練趨勢，不等同正式計時。</p>
 <button class="sim" type="button" id="simBtn">岸上試跑（模擬資料，不用 GPS）</button>
-<p class="note" id="ver">版本 v3（2026-10-30）· 距離：速度積分 · 起表：動作感測器</p>
+<p class="note" id="ver">版本 v4（2026-10-30）· 距離：速度積分 · 起表：動作感測器</p>
 
 </div>
 
@@ -208,7 +232,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   /* ---------- 動作感測器（IMU） ---------- */
   var IMU={status:"none", buf:[], listening:false};
   function showImu(){
-    var map={on:["good","動作感測 ON"], wait:["fair","動作感測…"], denied:["bad","動作感測被拒"], none:["","動作感測 —"]};
+    var map={on:["good","動作感測 ON"], wait:["fair","動作感測…"], denied:["bad","動作感測被拒"], none:["","動作感測 —"], idle:["","動作感測 待命"]};
     var v=map[IMU.status]||map.none;
     $("imu").className="gps "+v[0]; $("imuText").textContent=v[1];
   }
@@ -224,6 +248,10 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     else { var g=e.accelerationIncludingGravity; if(g && g.x!=null) m=Math.abs(Math.sqrt(g.x*g.x+g.y*g.y+g.z*g.z)-9.81); }
     if(m==null || isNaN(m)) return;
     imuPush(Date.now(), m, false);
+  }
+  function disableImu(){
+    if(IMU.listening){ window.removeEventListener("devicemotion", onMotion); IMU.listening=false; }
+    IMU.buf=[]; IMU.status="idle"; showImu();
   }
   function enableImu(){
     if(IMU.listening) return;
@@ -246,8 +274,8 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     var b=IMU.buf, i, j;
     if(b.length<40) return null;
     var base=[];
-    for(i=0;i<b.length;i++) if(b[i].t<tStill-1500 && b[i].t>=tStill-6500) base.push(b[i].m);
-    if(base.length<20) return null;
+    for(i=0;i<b.length;i++) if(b[i].t<tStill-1500 && b[i].t>=tStill-8000) base.push(b[i].m);
+    if(base.length<30) return null;
     var mean=0; for(i=0;i<base.length;i++) mean+=base[i]; mean/=base.length;
     var v=0; for(i=0;i<base.length;i++) v+=(base[i]-mean)*(base[i]-mean);
     var sd=Math.sqrt(v/base.length);
@@ -355,6 +383,12 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   /* ---------- 按鈕 ---------- */
   $("main").addEventListener("click",function(){
     if(!ac){ try{ ac=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+    touch();
+    if((S.phase==="idle"||S.phase==="done") && gpsPaused){
+      gotFix=false; startGps();
+      showAlert("GPS 重新定位中，等右上角燈號變綠後再按開始。");
+      return;
+    }
     if(S.phase==="idle"||S.phase==="done"){
       stopSim(); clearResults();
       S.start=null; S.armedFixes=[]; moving=0; lastStill=null;
@@ -373,23 +407,30 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
       finish(false);
     }
   });
-  $("reset").addEventListener("click",function(){ stopSim(); S.phase="idle"; releaseAwake(); clearResults(); render(); });
+  $("reset").addEventListener("click",function(){ touch(); stopSim(); stopClock(); S.phase="idle"; releaseAwake(); disableImu(); clearResults(); render(); });
 
   function finish(complete){
     var wasRunning=S.phase==="running", wasSim=S.sim;
-    S.phase="done"; cancelAnimationFrame(S.raf); releaseAwake();
+    S.phase="done"; stopClock(); releaseAwake(); disableImu(); touch();
     if(complete){ beep(1040,0.4); buzz([300,100,300]); if(!wasSim) saveRun(); }
     if(!wasRunning) clearResults();
     render(); if(wasRunning) showResults();
+    if(S.cross[200]) $("clock").textContent=fmtT(S.cross[200].ms);
     if(wasSim) $("r200note").textContent="模擬";
     stopSim();
   }
 
   /* ---------- 畫面 ---------- */
+  var clockTimer=null;
+  function getFps(){ var v=+$("fps").value; return v>0 ? v : 4; }
+  function stopClock(){ if(clockTimer){ clearInterval(clockTimer); clockTimer=null; } }
   function loop(){
-    if(S.phase!=="running") return;
-    $("clock").textContent=fmtT(Math.max(0,Date.now()-S.startTime));
-    S.raf=requestAnimationFrame(loop);
+    stopClock();
+    var tick=function(){
+      if(S.phase!=="running"){ stopClock(); return; }
+      $("clock").textContent=fmtT(Math.max(0,Date.now()-S.startTime));
+    };
+    tick(); clockTimer=setInterval(tick, Math.round(1000/getFps()));
   }
   function render(){
     var b=$("main"), p=$("phase");
@@ -506,11 +547,38 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     S.simTimer=setInterval(function(){ if(S.phase==="done"){ stopSim(); return; } feed(); },1000);
   });
 
+  /* ---------- 設定 ---------- */
+  var SKEY="db200_settings";
+  function loadSettings(){
+    try{ var s=JSON.parse(localStorage.getItem(SKEY)||"{}");
+      if(s.fps) $("fps").value=String(s.fps);
+      if(s.idle!=null) $("idle").value=String(s.idle);
+    }catch(e){}
+  }
+  function saveSettings(){ try{ localStorage.setItem(SKEY, JSON.stringify({fps:+$("fps").value, idle:+$("idle").value})); }catch(e){} }
+  $("fps").addEventListener("change",function(){ saveSettings(); if(S.phase==="running") loop(); });
+  $("idle").addEventListener("change",function(){ saveSettings(); touch(); });
+
+  /* ---------- 閒置自動暫停 GPS ---------- */
+  var lastActive=Date.now(), gpsPaused=false;
+  function touch(){ lastActive=Date.now(); }
+  function pauseGps(){
+    if(watchId!==null){ try{ navigator.geolocation.clearWatch(watchId); }catch(e){} watchId=null; }
+    gpsPaused=true; S.recent=[];
+    $("gps").className="gps"; $("gpsText").textContent="GPS 已暫停（點此恢復）";
+  }
+  setInterval(function(){
+    var mins=+$("idle").value;
+    if(!mins || gpsPaused || S.sim) return;
+    if((S.phase==="idle"||S.phase==="done") && Date.now()-lastActive>mins*60000) pauseGps();
+  },15000);
+
   /* ---------- 啟動 GPS ---------- */
   var watchId=null, gotFix=false;
   function startGps(){
     if(!("geolocation" in navigator)){ showAlert("這個瀏覽器不支援定位。請用 iPhone 的 Safari 開啟 https 網址。"); return; }
     if(watchId!==null){ try{ navigator.geolocation.clearWatch(watchId); }catch(e){} }
+    gpsPaused=false; touch();
     $("gpsText").textContent="定位中…";
     watchId=navigator.geolocation.watchPosition(function(p){
       if(!gotFix){ gotFix=true; showAlert(""); }
@@ -532,7 +600,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   $("gps").addEventListener("click",function(){ if(window.isSecureContext){ gotFix=false; startGps(); } });
   $("imu").style.cursor="pointer";
   $("imu").addEventListener("click",enableImu);
-  drawHist(); render(); showImu();
+  loadSettings(); drawHist(); render(); showImu();
 })();
 </script>
 
