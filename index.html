@@ -23,6 +23,7 @@ html,body{margin:0}
 body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.45;
   padding:max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));}
 .wrap{max-width:520px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
 header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 h1{font-size:20px;margin:0;letter-spacing:.02em}
 .gps{display:flex;align-items:center;gap:8px;font-size:14px;padding:6px 10px;border-radius:999px;border:2px solid var(--line);background:var(--panel);font-variant-numeric:tabular-nums}
@@ -84,7 +85,10 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
 
 <header>
   <h1>龍舟 200m 測速</h1>
-  <div id="gps" class="gps" role="status"><span class="dot"></span><span id="gpsText">等待 GPS…</span></div>
+  <div class="chips">
+    <div id="gps" class="gps" role="status"><span class="dot"></span><span id="gpsText">等待 GPS…</span></div>
+    <div id="imu" class="gps" role="status"><span class="dot"></span><span id="imuText">動作感測 —</span></div>
+  </div>
 </header>
 
 <div id="alert" class="alert" hidden></div>
@@ -105,7 +109,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   <button id="reset" type="button">重置</button>
 </div>
 <label class="opt"><input type="checkbox" id="auto" checked>
-  <span>自動起航：按「開始」先鎖定起點，船一動（速度 &gt; 1.5 m/s）才起表。船上沒人能按手機時用這個。</span></label>
+  <span>自動起航：按「開始」先鎖定起點，船一動才起表。起表時間以動作感測器偵測到的第一槳加速為準；第一次按開始時 iPhone 會詢問「動作與方向」權限，請選允許。</span></label>
 
 <section class="res hero">
   <h2>0 → 200 m <span id="r200note">—</span></h2>
@@ -115,6 +119,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     <div class="stat"><small>最大速度</small><b id="m200">—</b><em id="m200m"></em></div>
   </div>
   <div class="splits" id="splits"></div>
+  <div class="splits" id="quality"></div>
 </section>
 
 <section class="res">
@@ -148,7 +153,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   <textarea id="csvBox" readonly hidden></textarea>
 </details>
 
-<p class="note">速度單位為 km/h，下方小字為 m/s。時間是用前後兩筆 GPS 位置內插算出的過線時間。手機 GPS 誤差約 ±3–5 m，以 4–5 m/s 的船速換算，單趟時間可能有 ±1 秒左右的誤差，適合看訓練趨勢，不適合當正式成績。</p>
+<p class="note">速度單位為 km/h，下方小字為 m/s。距離由 GPS 都卜勒速度逐秒累加，過線時間在兩筆定位之間依加速度推算；起表時間優先採用動作感測器偵測的起航瞬間。精度比單純用位置相減好，但仍受手機 GPS 限制，適合看訓練趨勢，不等同正式計時。</p>
 <button class="sim" type="button" id="simBtn">岸上試跑（模擬資料，不用 GPS）</button>
 
 </div>
@@ -157,21 +162,21 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
 (function(){
   "use strict";
   var TARGETS = [100,150,200];
-  var MAX_ACC = 20;          // 超過此誤差（公尺）的定位點不採用
-  var AUTO_SPEED = 1.5;      // m/s，自動起航門檻
+  var MAX_ACC = 20;        // 誤差超過此值（公尺）的定位點不採用
+  var AUTO_SPEED = 1.5;    // m/s，自動起航判定速度
+  var MAX_ACCEL = 3.5;     // m/s²，合理的最大加減速，超過視為雜訊
   var $ = function(id){ return document.getElementById(id); };
 
   var S = {
-    phase:"idle",   // idle | armed | running | done
+    phase:"idle",          // idle | armed | running | done
     sim:false, simTimer:null,
-    recent:[],      // 最近幾秒的定位（用來平均起點）
-    lastFix:null,
-    start:null, startTime:0,
-    prev:null,      // 上一筆 {d,t}
-    speeds:[], cur:0,
+    recent:[], armedFixes:[],
+    start:null, startTime:0, src:"",
+    prev:null,             // {t, v, d(積分距離), ds(直線距離)}
     cross:{}, max:{100:0,150:0,200:0},
-    dist:0, poor:0, raf:0
+    dist:0, straight:0, cur:0, poor:0, noDoppler:0, fixes:0, raf:0
   };
+  var moving = 0, lastStill = null;
 
   /* ---------- 工具 ---------- */
   function hav(a,b){
@@ -180,7 +185,6 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     var x=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(dLon/2)*Math.sin(dLon/2);
     return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
   }
-  function median(arr){ var s=arr.slice().sort(function(a,b){return a-b;}); return s[Math.floor(s.length/2)]; }
   function fmtT(ms){ if(ms==null) return "—"; var s=ms/1000; var m=Math.floor(s/60); var r=(s-m*60).toFixed(2); return m>0 ? m+":"+(r<10?"0":"")+r : r; }
   function kmh(ms){ return (ms*3.6).toFixed(1); }
 
@@ -192,7 +196,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   function releaseAwake(){ try{ if(wake){ wake.release(); wake=null; } }catch(e){} }
   document.addEventListener("visibilitychange",function(){ if(document.visibilityState==="visible" && (S.phase==="armed"||S.phase==="running")) keepAwake(); });
 
-  /* ---------- GPS 狀態列 ---------- */
+  /* ---------- 狀態列 ---------- */
   function showGps(acc){
     var el=$("gps");
     el.className="gps "+(acc<=5?"good":acc<=MAX_ACC?"fair":"bad");
@@ -200,7 +204,64 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   }
   function showAlert(msg){ var a=$("alert"); a.textContent=msg; a.hidden=!msg; }
 
-  /* ---------- 接收定位 ---------- */
+  /* ---------- 動作感測器（IMU） ---------- */
+  var IMU={status:"none", buf:[], listening:false};
+  function showImu(){
+    var map={on:["good","動作感測 ON"], wait:["fair","動作感測…"], denied:["bad","動作感測被拒"], none:["","動作感測 —"]};
+    var v=map[IMU.status]||map.none;
+    $("imu").className="gps "+v[0]; $("imuText").textContent=v[1];
+  }
+  function imuPush(t,m,isSim){
+    if(!!isSim!==S.sim) return;
+    IMU.buf.push({t:t,m:m});
+    var cut=t-20000; while(IMU.buf.length && IMU.buf[0].t<cut) IMU.buf.shift();
+    if(IMU.status!=="on"){ IMU.status="on"; showImu(); }
+  }
+  function onMotion(e){
+    var a=e.acceleration, m=null;
+    if(a && a.x!=null && a.y!=null && a.z!=null) m=Math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z);
+    else { var g=e.accelerationIncludingGravity; if(g && g.x!=null) m=Math.abs(Math.sqrt(g.x*g.x+g.y*g.y+g.z*g.z)-9.81); }
+    if(m==null || isNaN(m)) return;
+    imuPush(Date.now(), m, false);
+  }
+  function enableImu(){
+    if(IMU.listening) return;
+    if(typeof window.DeviceMotionEvent==="undefined"){ IMU.status="none"; showImu(); return; }
+    var attach=function(){
+      window.addEventListener("devicemotion", onMotion);
+      IMU.listening=true;
+      if(IMU.status!=="on"){ IMU.status="wait"; showImu(); }
+      setTimeout(function(){ if(IMU.status==="wait"){ IMU.status="none"; showImu(); } },3000);
+    };
+    if(typeof DeviceMotionEvent.requestPermission==="function"){
+      // iPhone：必須在按鈕點擊當下詢問
+      DeviceMotionEvent.requestPermission().then(function(r){
+        if(r==="granted") attach(); else { IMU.status="denied"; showImu(); }
+      }).catch(function(){ IMU.status="denied"; showImu(); });
+    } else attach();
+  }
+  // 在「最後靜止點前 1.5 秒」到「GPS 確認移動」之間，找第一個明顯高於靜止雜訊的加速度
+  function findImuOnset(tStill, tConfirm){
+    var b=IMU.buf, i, j;
+    if(b.length<40) return null;
+    var base=[];
+    for(i=0;i<b.length;i++) if(b[i].t<tStill-1500 && b[i].t>=tStill-6500) base.push(b[i].m);
+    if(base.length<20) return null;
+    var mean=0; for(i=0;i<base.length;i++) mean+=base[i]; mean/=base.length;
+    var v=0; for(i=0;i<base.length;i++) v+=(base[i]-mean)*(base[i]-mean);
+    var sd=Math.sqrt(v/base.length);
+    var thr=Math.max(1.2, mean+4*sd);
+    var win=[];
+    for(i=0;i<b.length;i++) if(b[i].t>=tStill-1500 && b[i].t<=tConfirm) win.push(b[i]);
+    var N=6;
+    for(i=N-1;i<win.length;i++){
+      var sum=0; for(j=i-N+1;j<=i;j++) sum+=win[j].m;
+      if(sum/N>thr) return win[i-N+1].t;
+    }
+    return null;
+  }
+
+  /* ---------- GPS ---------- */
   function onPos(pos, isSim){
     if(S.sim!==!!isSim) return;
     var c=pos.coords, now=Date.now();
@@ -208,10 +269,8 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     var fix={lat:c.latitude, lon:c.longitude, acc:c.accuracy||99, t:t,
              spd:(typeof c.speed==="number" && c.speed>=0 && !isNaN(c.speed)) ? c.speed : null};
     showGps(fix.acc);
-    S.lastFix=fix;
     S.recent.push(fix);
     while(S.recent.length && t-S.recent[0].t>4000) S.recent.shift();
-
     if(S.phase==="armed") checkAutoStart(fix);
     else if(S.phase==="running") track(fix);
   }
@@ -223,76 +282,91 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     return {lat:lat/good.length, lon:lon/good.length};
   }
 
-  function speedOf(fix,d){
-    if(fix.spd!=null) return fix.spd;
-    if(S.prev && fix.t>S.prev.t) return Math.max(0,(d-S.prev.d)/((fix.t-S.prev.t)/1000));
-    return 0;
-  }
-
-  /* 自動起航：鎖定起點後等船動 */
-  var moving=0, lastStill=null;
   function checkAutoStart(fix){
     if(fix.acc>MAX_ACC) return;
-    if(!S.start){ S.start=averagedStart()||{lat:fix.lat,lon:fix.lon}; }
+    if(!S.start) S.start=averagedStart()||{lat:fix.lat,lon:fix.lon};
     var d=hav(S.start,fix);
     var v=fix.spd!=null ? fix.spd : (lastStill && fix.t>lastStill.t ? Math.max(0,(d-lastStill.d)/((fix.t-lastStill.t)/1000)) : 0);
-    if(v>=AUTO_SPEED || d>=6){ moving++; } else { moving=0; lastStill={d:d,t:fix.t}; }
+    S.armedFixes.push(fix); if(S.armedFixes.length>12) S.armedFixes.shift();
+    if(v>=AUTO_SPEED || d>=8){ moving++; } else { moving=0; lastStill={d:d,t:fix.t}; }
     if(moving>=2){
-      // 起表時間取「最後一筆靜止點」，避免晚 1~2 秒
-      var t0=lastStill ? lastStill.t : fix.t;
-      beginRun(t0, lastStill);
-      track(fix);
+      var tStill=lastStill ? lastStill.t : fix.t;
+      var imuT=findImuOnset(tStill, fix.t);
+      beginRun(imuT||tStill, imuT?"動作感測器":"GPS");
     }
   }
 
-  function beginRun(t0, still){
-    S.phase="running"; S.startTime=t0;
-    S.prev=still ? {d:still.d,t:still.t} : null;
-    S.speeds=[]; S.cross={}; S.max={100:0,150:0,200:0}; S.dist=0; S.poor=0;
+  function beginRun(t0, src){
+    S.phase="running"; S.startTime=t0; S.src=src;
+    S.prev={t:t0, v:0, d:0, ds:0};
+    S.cross={}; S.max={100:0,150:0,200:0}; S.dist=0; S.straight=0; S.cur=0; S.poor=0; S.noDoppler=0; S.fixes=0;
     beep(880,0.15); buzz(120);
+    var pending=S.armedFixes.filter(function(f){return f.t>t0;});
+    S.armedFixes=[];
     render(); loop();
+    for(var i=0;i<pending.length && S.phase==="running";i++) track(pending[i]);
+  }
+
+  // 在一段時間內，假設加速度固定，算出距離到達 T 所需的秒數
+  function crossTau(d0,v0,v1,dt,T){
+    var need=T-d0, a=(v1-v0)/dt, tau;
+    if(Math.abs(a)<1e-6) tau = v0>0 ? need/v0 : dt;
+    else {
+      var disc=v0*v0+2*a*need;
+      tau = disc>=0 ? (-v0+Math.sqrt(disc))/a : dt;
+    }
+    if(!(tau>=0 && tau<=dt)){ var avg=(v0+v1)/2; tau = avg>0 ? need/avg : dt; }
+    return Math.min(dt, Math.max(0, tau));
   }
 
   function track(fix){
-    if(fix.acc>MAX_ACC){ S.poor++; return; }
-    if(!S.start){ S.start={lat:fix.lat,lon:fix.lon}; S.prev={d:0,t:fix.t}; return; }
-    var d=hav(S.start,fix);
-    var v=speedOf(fix,d);
-    S.speeds.push(v); if(S.speeds.length>3) S.speeds.shift();
-    var sm=median(S.speeds); S.cur=sm;
-    TARGETS.forEach(function(T){ if(!S.cross[T] && sm>S.max[T]) S.max[T]=sm; });
+    if(S.phase!=="running") return;
+    if(fix.acc>MAX_ACC){ S.poor++; render(); return; }
+    if(!S.start) S.start={lat:fix.lat, lon:fix.lon};
+    if(fix.t<=S.prev.t) return;
+    var ds=hav(S.start,fix);
+    var dt=(fix.t-S.prev.t)/1000;
+    var v;
+    if(fix.spd!=null) v=fix.spd;
+    else { v=Math.max(0,(ds-S.prev.ds)/dt); S.noDoppler++; }
+    // 加速度不合理（GPS 跳動）就限制在合理範圍內
+    var lim=MAX_ACCEL*dt;
+    if(v>S.prev.v+lim) v=S.prev.v+lim;
+    if(v<S.prev.v-lim) v=Math.max(0,S.prev.v-lim);
+    S.fixes++;
 
-    if(S.prev){
-      TARGETS.forEach(function(T){
-        if(!S.cross[T] && S.prev.d<T && d>=T){
-          var k=(T-S.prev.d)/(d-S.prev.d);
-          var tc=S.prev.t+k*(fix.t-S.prev.t);
-          S.cross[T]={ms:Math.max(1,tc-S.startTime)};
-          if(T<200){ beep(660,0.1); buzz(80); }
-        }
-      });
-    }
-    if(!S.prev || d>S.prev.d-15) S.prev={d:d,t:fix.t};
-    S.dist=d;
-    if(S.cross[200]) finish(true);
-    else render();
+    var d1=S.prev.d+(S.prev.v+v)/2*dt;
+    TARGETS.forEach(function(T){
+      if(S.cross[T]) return;
+      if(S.prev.d<T && d1>=T){
+        var tau=crossTau(S.prev.d,S.prev.v,v,dt,T);
+        var vAt=S.prev.v+(v-S.prev.v)*(tau/dt);
+        if(vAt>S.max[T]) S.max[T]=vAt;
+        S.cross[T]={ms:Math.max(1, S.prev.t+tau*1000-S.startTime)};
+        if(T<200){ beep(660,0.1); buzz(80); }
+      } else if(v>S.max[T]) S.max[T]=v;
+    });
+    S.prev={t:fix.t, v:v, d:d1, ds:ds};
+    S.dist=d1; S.straight=ds; S.cur=v;
+    if(S.cross[200]) finish(true); else render();
   }
 
-  /* ---------- 流程按鈕 ---------- */
+  /* ---------- 按鈕 ---------- */
   $("main").addEventListener("click",function(){
     if(!ac){ try{ ac=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
     if(S.phase==="idle"||S.phase==="done"){
-      clearResults();
-      S.start=null; moving=0; lastStill=null;
+      stopSim(); clearResults();
+      S.start=null; S.armedFixes=[]; moving=0; lastStill=null;
       keepAwake();
       if($("auto").checked){
+        enableImu();
         S.start=averagedStart();
         if(S.start) lastStill={d:0,t:Date.now()};
         S.phase="armed"; beep(520,0.08);
         render();
       } else {
         S.start=averagedStart();
-        beginRun(Date.now(), S.start ? {d:0,t:Date.now()} : null);
+        beginRun(Date.now(),"手動");
       }
     } else {
       finish(false);
@@ -304,8 +378,8 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     var wasRunning=S.phase==="running", wasSim=S.sim;
     S.phase="done"; cancelAnimationFrame(S.raf); releaseAwake();
     if(complete){ beep(1040,0.4); buzz([300,100,300]); if(!wasSim) saveRun(); }
-    if(!wasRunning) { clearResults(); }
-    render(); showResults(complete);
+    if(!wasRunning) clearResults();
+    render(); if(wasRunning) showResults();
     if(wasSim) $("r200note").textContent="模擬";
     stopSim();
   }
@@ -313,15 +387,15 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   /* ---------- 畫面 ---------- */
   function loop(){
     if(S.phase!=="running") return;
-    $("clock").textContent=fmtT(Date.now()-S.startTime);
+    $("clock").textContent=fmtT(Math.max(0,Date.now()-S.startTime));
     S.raf=requestAnimationFrame(loop);
   }
   function render(){
     var b=$("main"), p=$("phase");
     if(S.phase==="idle"){ b.textContent="開始"; b.className=""; p.textContent="準備中：請在起點靜止，等 GPS 變綠再按開始"; }
     if(S.phase==="armed"){ b.textContent="取消"; b.className="armed"; p.textContent="已鎖定起點，等待起航…（船一動自動起表）"; $("clock").textContent="00.00"; }
-    if(S.phase==="running"){ b.textContent="停止"; b.className="stop"; p.textContent="測量中 — 到 200 m 自動停止"; }
-    if(S.phase==="done"){ b.textContent="再測一趟"; b.className=""; p.textContent=S.cross[200]?"完成":"已手動停止（未滿 200 m）"; }
+    if(S.phase==="running"){ b.textContent="停止"; b.className="stop"; p.textContent="測量中（起表："+S.src+"）— 到 200 m 自動停止"; }
+    if(S.phase==="done"){ b.textContent="再測一趟"; b.className=""; p.textContent=S.cross[200]?"完成":"已停止（未滿 200 m）"; }
     $("dist").textContent=S.dist.toFixed(1);
     $("spd").textContent=kmh(S.cur||0);
     $("bar").style.width=Math.min(100,S.dist/2)+"%";
@@ -341,12 +415,21 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     if(c[100]) sp.push("0–100 "+fmtT(c[100].ms)+"s");
     if(c[100]&&c[150]) sp.push("100–150 "+fmtT(c[150].ms-c[100].ms)+"s · "+kmh(50/((c[150].ms-c[100].ms)/1000))+" km/h");
     if(c[150]&&c[200]) sp.push("150–200 "+fmtT(c[200].ms-c[150].ms)+"s · "+kmh(50/((c[200].ms-c[150].ms)/1000))+" km/h");
-    $("splits").textContent=sp.length? "分段："+sp.join("　") : "";
-    $("r200note").textContent=S.sim?"模擬":(c[200]?new Date().toLocaleTimeString("zh-TW",{hour:"2-digit",minute:"2-digit"}):"—");
+    $("splits").textContent=sp.length ? "分段："+sp.join("　") : "";
+    var q=["起表依據："+S.src];
+    if(S.fixes && S.noDoppler/S.fixes>0.3) q.push("手機未提供 GPS 速度，距離改用位置計算，誤差較大");
+    else q.push("距離：GPS 速度積分");
+    if(S.dist>50){
+      var diff=S.straight-S.dist;
+      if(Math.abs(diff)>Math.max(10,0.08*S.dist)) q.push("⚠ 直線距離 "+S.straight.toFixed(0)+" m 與積分距離差距大，可能航線不直或訊號不穩");
+      else q.push("直線距離檢核 "+S.straight.toFixed(0)+" m");
+    }
+    $("quality").textContent=q.join("　·　");
+    $("r200note").textContent=c[200]?new Date().toLocaleTimeString("zh-TW",{hour:"2-digit",minute:"2-digit"}):"—";
   }
   function clearResults(){
-    S.cross={}; S.max={100:0,150:0,200:0}; S.dist=0; S.cur=0; S.poor=0;
-    TARGETS.forEach(setStat); $("splits").textContent=""; $("r200note").textContent="—";
+    S.cross={}; S.max={100:0,150:0,200:0}; S.dist=0; S.straight=0; S.cur=0; S.poor=0;
+    TARGETS.forEach(setStat); $("splits").textContent=""; $("quality").textContent=""; $("r200note").textContent="—";
     $("clock").textContent="00.00"; showAlert("");
   }
 
@@ -354,10 +437,9 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   var KEY="db200_runs";
   function loadRuns(){ try{ return JSON.parse(localStorage.getItem(KEY)||"[]"); }catch(e){ return []; } }
   function saveRun(){
-    if(S.sim) return;
     var c=S.cross, runs=loadRuns();
     runs.unshift({at:Date.now(), t200:c[200].ms, t100:c[100]?c[100].ms:null, t150:c[150]?c[150].ms:null,
-      max200:S.max[200], max100:S.max[100], max150:S.max[150]});
+      max200:S.max[200], max100:S.max[100], max150:S.max[150], src:S.src});
     try{ localStorage.setItem(KEY,JSON.stringify(runs.slice(0,200))); }catch(e){}
     drawHist();
   }
@@ -365,8 +447,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     var runs=loadRuns(), tb=$("hbody"); tb.textContent="";
     $("hcount").textContent=runs.length;
     runs.forEach(function(r){
-      var tr=document.createElement("tr");
-      var d=new Date(r.at);
+      var tr=document.createElement("tr"), d=new Date(r.at);
       [ (d.getMonth()+1)+"/"+d.getDate()+" "+d.toLocaleTimeString("zh-TW",{hour:"2-digit",minute:"2-digit"}),
         fmtT(r.t200), kmh(200/(r.t200/1000)), kmh(r.max200), fmtT(r.t100), fmtT(r.t150)
       ].forEach(function(v){ var td=document.createElement("td"); td.textContent=v; tr.appendChild(td); });
@@ -374,11 +455,11 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     });
   }
   function csv(){
-    var rows=[["日期時間","200m秒","200m均速kmh","200m極速kmh","100m秒","100m均速kmh","100m極速kmh","150m秒","150m均速kmh","150m極速kmh"]];
+    var rows=[["日期時間","200m秒","200m均速kmh","200m極速kmh","100m秒","100m均速kmh","100m極速kmh","150m秒","150m均速kmh","150m極速kmh","起表依據"]];
     loadRuns().forEach(function(r){
-      rows.push([new Date(r.at).toLocaleString("zh-TW"), (r.t200/1000).toFixed(2), kmh(200/(r.t200/1000)), kmh(r.max200),
+      rows.push([new Date(r.at).toLocaleString("zh-TW").replace(/,/g," "), (r.t200/1000).toFixed(2), kmh(200/(r.t200/1000)), kmh(r.max200),
         r.t100?(r.t100/1000).toFixed(2):"", r.t100?kmh(100/(r.t100/1000)):"", kmh(r.max100),
-        r.t150?(r.t150/1000).toFixed(2):"", r.t150?kmh(150/(r.t150/1000)):"", kmh(r.max150)]);
+        r.t150?(r.t150/1000).toFixed(2):"", r.t150?kmh(150/(r.t150/1000)):"", kmh(r.max150), r.src||""]);
     });
     return rows.map(function(r){return r.join(",");}).join("\n");
   }
@@ -386,34 +467,40 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
     var text=csv(), box=$("csvBox");
     box.value=text; box.hidden=false;
     var done=function(){ $("copyCsv").textContent="已複製"; setTimeout(function(){$("copyCsv").textContent="複製 CSV";},1500); };
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(text).then(done,function(){ box.select(); });
-    } else { box.select(); }
+    if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done,function(){ box.select(); });
+    else box.select();
   });
   var clearArmed=false;
   $("clearHist").addEventListener("click",function(){
-    if(!clearArmed){ clearArmed=true; this.textContent="再按一次確認清除"; var b=this; setTimeout(function(){clearArmed=false;b.textContent="清除紀錄";},3000); return; }
+    var b=this;
+    if(!clearArmed){ clearArmed=true; b.textContent="再按一次確認清除"; setTimeout(function(){clearArmed=false;b.textContent="清除紀錄";},3000); return; }
     try{ localStorage.removeItem(KEY); }catch(e){}
-    clearArmed=false; this.textContent="清除紀錄"; drawHist();
+    clearArmed=false; b.textContent="清除紀錄"; drawHist();
   });
 
-  /* ---------- 模擬（只用來在岸上看畫面） ---------- */
+  /* ---------- 岸上試跑（模擬 GPS + 動作感測器） ---------- */
   function stopSim(){ if(S.simTimer){ clearInterval(S.simTimer); S.simTimer=null; } S.sim=false; }
   $("simBtn").addEventListener("click",function(){
-    stopSim(); S.sim=true; clearResults();
+    stopSim(); clearResults();
+    S.sim=true; S.recent=[]; S.armedFixes=[]; S.start=null; moving=0; lastStill=null;
+    IMU.buf=[];
     var o={lat:25.0136, lon:121.4632}, d=0, v=0, k=0, brg=0.6;
-    S.recent=[]; S.start=null; moving=0; lastStill=null;
     var feed=function(){
       k++;
-      if(k>3) v=Math.min(5.1, v+ (v<3?1.2:0.35)) - (d>160?0.05:0);
-      d+=v;
+      var vOld=v;
+      if(k>3) v=Math.min(5.1, v+(v<3?1.2:0.35)) - (d>160?0.05:0);
+      d+=(vOld+v)/2;
+      var now=Date.now(), acc=v-vOld;
+      for(var i=0;i<50;i++){
+        var stroke = k>3 ? Math.abs(Math.sin(i/50*Math.PI*2*1.1))*1.5 : 0;
+        imuPush(now-1000+i*20, 0.15+Math.random()*0.15+(acc>0.2?2*acc:0)+stroke, true);
+      }
       var n=(Math.random()-0.5)*1.5;
       var lat=o.lat+((d+n)*Math.cos(brg))/111320;
       var lon=o.lon+((d+n)*Math.sin(brg))/(111320*Math.cos(o.lat*Math.PI/180));
-      onPos({timestamp:Date.now(), coords:{latitude:lat, longitude:lon, accuracy:3+Math.random()*2, speed:v+(Math.random()-0.5)*0.4}}, true);
+      onPos({timestamp:now, coords:{latitude:lat, longitude:lon, accuracy:3+Math.random()*2, speed:v+(Math.random()-0.5)*0.2}}, true);
     };
-    feed(); feed();
-    S.recent.forEach(function(){}); S.start=averagedStart(); lastStill={d:0,t:Date.now()};
+    feed(); S.start=averagedStart(); lastStill={d:0,t:Date.now()};
     S.phase="armed"; render();
     S.simTimer=setInterval(function(){ if(S.phase==="done"){ stopSim(); return; } feed(); },1000);
   });
@@ -421,9 +508,7 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
   /* ---------- 啟動 GPS ---------- */
   var watchId=null, gotFix=false;
   function startGps(){
-    if(!("geolocation" in navigator)){
-      showAlert("這個瀏覽器不支援定位。請用 iPhone 的 Safari 開啟 https 網址。"); return;
-    }
+    if(!("geolocation" in navigator)){ showAlert("這個瀏覽器不支援定位。請用 iPhone 的 Safari 開啟 https 網址。"); return; }
     if(watchId!==null){ try{ navigator.geolocation.clearWatch(watchId); }catch(e){} }
     $("gpsText").textContent="定位中…";
     watchId=navigator.geolocation.watchPosition(function(p){
@@ -434,23 +519,21 @@ textarea{width:100%;min-height:90px;margin-top:8px;font-family:var(--mono);font-
       if(err.code===1){ $("gpsText").textContent="定位被拒"; showAlert("定位權限被拒絕。iPhone：設定 → 隱私權與安全性 → 定位服務 → Safari 網站，設為「使用 App 期間」並開啟「精確位置」；再到 Safari 網址列左邊「ᴀA」→ 網站設定 → 位置 → 允許，然後重新整理本頁。"); }
       else { $("gpsText").textContent="等待訊號…"; }
     }, {enableHighAccuracy:true, maximumAge:0});
-    // 15 秒還沒拿到定位就提示
     setTimeout(function(){
       if(!gotFix && !S.sim) showAlert("15 秒內沒有收到定位。請確認：1) 是用 Safari 開 https 網址（不是檔案預覽）；2) 人在戶外空曠處；3) 已允許本網站使用位置。可按右上角 GPS 標籤重新啟動定位。");
     },15000);
   }
-
   if(!window.isSecureContext){
     $("gps").className="gps bad"; $("gpsText").textContent="無法定位";
-    showAlert("目前不是用 https 網址開啟，iPhone 不允許網頁使用定位。請把檔案放到 https 網址（例如 Netlify Drop），再用 Safari 開啟。");
-  } else {
-    startGps();
-  }
-  // 點 GPS 標籤可手動重新啟動定位（也會觸發權限詢問）
+    showAlert("目前不是用 https 網址開啟，iPhone 不允許網頁使用定位。請用 https://ying-jun-huang.github.io/dragonboat-timer/ 開啟。");
+  } else startGps();
   $("gps").style.cursor="pointer";
   $("gps").addEventListener("click",function(){ if(window.isSecureContext){ gotFix=false; startGps(); } });
-  drawHist(); render();
+  $("imu").style.cursor="pointer";
+  $("imu").addEventListener("click",enableImu);
+  drawHist(); render(); showImu();
 })();
 </script>
+
 </body>
 </html>
